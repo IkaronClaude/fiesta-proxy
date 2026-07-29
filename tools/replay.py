@@ -61,6 +61,10 @@ def parse_args() -> argparse.Namespace:
                    help="hex MD5 (32 chars) to substitute into opcode 0x0C65 USER_CLIENT_VERSION_CHECK_REQ "
                         "payload bytes 0..31 before sending. Use when the target server expects a different "
                         "client version than the one the capture was made with.")
+    p.add_argument("--login-user", default=None,
+                   help="override sUserName (@0, char[260]) in the 0x0C5A NC_USER_US_LOGIN_REQ frame")
+    p.add_argument("--login-pw-md5", default=None,
+                   help="override sPassword (@260, char[36]) in 0x0C5A with this MD5 hex (32 chars)")
     return p.parse_args()
 
 
@@ -199,6 +203,22 @@ def main() -> int:
                 decrypted_bodies[i] = bytes(body[:2]) + bytes(payload)
                 patched += 1
         print(f"[patch] substituted version MD5 in {patched} 0x0C65 frame(s) -> {new_hex}")
+
+    if args.login_user or args.login_pw_md5:
+        patched = 0
+        for i, body in enumerate(decrypted_bodies):
+            if opcode_of(body) == 0x0C5A and len(body) >= 2 + 296:
+                payload = bytearray(payload_of(body))
+                if args.login_user:
+                    payload[0:260] = b"\x00" * 260
+                    payload[0:len(args.login_user)] = args.login_user.encode("ascii")
+                if args.login_pw_md5:
+                    pw = args.login_pw_md5.strip().encode("ascii")
+                    payload[260:296] = b"\x00" * 36
+                    payload[260:260 + len(pw)] = pw
+                decrypted_bodies[i] = bytes(body[:2]) + bytes(payload)
+                patched += 1
+        print(f"[patch] rewrote credentials in {patched} 0x0C5A frame(s) -> user={args.login_user} pw={args.login_pw_md5}")
 
     if args.dry_run:
         for i, body in enumerate(decrypted_bodies):

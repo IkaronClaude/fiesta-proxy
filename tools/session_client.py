@@ -390,6 +390,8 @@ def main():
     p.add_argument("--proxy-login", default="127.0.0.1:9010")
     p.add_argument("--proxy-wm", default="127.0.0.1:9013")
     p.add_argument("--proxy-zone", default="127.0.0.1:9019")
+    p.add_argument("--login-user", default=None, help="override sUserName in the 0x0C5A login frame")
+    p.add_argument("--login-pw-md5", default=None, help="override sPassword (MD5 hex) in the 0x0C5A login frame")
     args = p.parse_args()
 
     streams = load_streams(args.pcap)
@@ -400,6 +402,21 @@ def main():
         raise SystemExit("Login capture has no handshake")
     login_bodies = decrypted_bodies(login_c2s, login_seed)
     print(f"[load] Login: {len(login_bodies)} C->S frames (capture seed=0x{login_seed:04X})")
+
+    if args.login_user or args.login_pw_md5:
+        for _i in range(len(login_bodies)):
+            off, plen, body = login_bodies[_i]
+            if opcode_of(body) == 0x0C5A and len(body) >= 2 + 296:
+                pl = bytearray(payload_of(body))
+                if args.login_user:
+                    pl[0:260] = b"\x00" * 260
+                    pl[0:len(args.login_user)] = args.login_user.encode("ascii")
+                if args.login_pw_md5:
+                    pw = args.login_pw_md5.strip().encode("ascii")
+                    pl[260:296] = b"\x00" * 36
+                    pl[260:260 + len(pw)] = pw
+                login_bodies[_i] = (off, plen, bytes(body[:2]) + bytes(pl))
+                print(f"[patch] login creds -> user={args.login_user}")
 
     wm_c2s, wm_s2c = stream_pair(streams, 9013)
     wm_seed = first_handshake_seed(wm_s2c)
