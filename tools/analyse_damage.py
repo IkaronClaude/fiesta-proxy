@@ -15,7 +15,12 @@ seed + stream separation). Adds:
   * ENTITY ROSTER -- handle -> mob-id (from NC_BRIEFINFO_REGENMOB) / player name, so --mob-id
     resolves to the attacker handle(s) without hardcoding anything.
   * DAMAGE HISTOGRAM -- DMG | Count table over NC_BAT_SWING_DAMAGE within a packet range,
-    filtered by mob-id / attacker / defender / stream.
+    filtered by mob-id / attacker / defender / stream. MULTIPLE CURVES per run: always split
+    by mob (Goblin Warrior Lv60 vs Lv61 = separate curves). With --split-stats, also split by
+    config SET = player stat signature (Vitality etc. captured BY VALUE via the 0x1035 stat
+    timeline) x the mob's active abstate set (Fatal Slash etc. by id, since mob DEF isn't on the
+    wire). So one fight -> up to 4 curves for one mob: {base, +vitality, +fatalslash, +both}.
+    Curves are NAMED by stat values (e.g. "STR87 END65 ... DEF180 Dmg113-131"), not buff names.
   * PLAYER STATS tracking (per stream) -- full snapshot from NC_MAP_LOGIN_ACK (0x1802) +
     LIVE updates from NC_CHAR_CHANGEPARAMCHANGE (0x1035, the wire-accurate values after free-stat
     allocation / gear / buffs -- no formula) + FREE-STAT ALLOC events (0x105F) + LEVEL UP (0x240C).
@@ -154,6 +159,71 @@ def stat_at(timeline, sid, pid):
         else:
             break
     return best  # (source_pid, snapshot) or None
+
+
+# ---- abstates (buffs/debuffs) ------------------------------------------------------------
+# Track per-entity active abstate ids. Captures e.g. Fatal Slash (a DEF-down debuff on the mob),
+# whose numeric effect on the mob's DEF is NOT on the wire -- so we represent it by the abstate id.
+# (A player buff like Vitality ALSO changes the player's DEF/Dmg, which we capture by VALUE via the
+#  0x1035 stat timeline; so player buffs split curves by stat values, mob debuffs by abstate id.)
+# Layouts RE'd from captures: ABSTATESET/RESET = handle u16@0, abstate id u16@2.
+# BRIEFINFO_ABSTATE_CHANGE = handle u16@0, id u16@2, ..., active-flag u32@10 (1=on).
+def build_abstate_timelines(frames, op_name):
+    n2o = {v: k for k, v in op_name.items()}
+    SET = n2o.get("NC_BAT_ABSTATESET_CMD")
+    RST = n2o.get("NC_BAT_ABSTATERESET_CMD")
+    CHG = n2o.get("NC_BRIEFINFO_ABSTATE_CHANGE_CMD")
+    active = collections.defaultdict(set)
+    tl = collections.defaultdict(list)   # handle -> [(pid, frozenset)]
+    for f in sorted(frames, key=lambda x: x["pid"]):
+        b = payload_of(f["body"])
+        h = aid = None
+        if SET is not None and f["op"] == SET and len(b) >= 4:
+            h, aid, on = (b[0] | (b[1] << 8)), (b[2] | (b[3] << 8)), True
+        elif RST is not None and f["op"] == RST and len(b) >= 4:
+            h, aid, on = (b[0] | (b[1] << 8)), (b[2] | (b[3] << 8)), False
+        elif CHG is not None and f["op"] == CHG and len(b) >= 14:
+            h, aid = (b[0] | (b[1] << 8)), (b[2] | (b[3] << 8))
+            on = int.from_bytes(b[10:14], "little") != 0
+        if h is None:
+            continue
+        if on:
+            active[h].add(aid)
+        else:
+            active[h].discard(aid)
+        tl[h].append((f["pid"], frozenset(active[h])))
+    return tl
+
+
+def abstate_at(tl, handle, pid):
+    """Active abstate-id set on `handle` at packet `pid` (empty if none/unknown)."""
+    best = frozenset()
+    for p, s in tl.get(handle, []):
+        if p <= pid:
+            best = s
+        else:
+            break
+    return best
+
+
+def stat_sig(snap):
+    """Compact stat SIGNATURE for curve naming -- by VALUES, not buff names (operator's ask):
+    e.g. 'STR87 END65 DEX57 INT16 SPR33 DEF180 Dmg113-131'."""
+    if not snap:
+        return "stats?"
+    g = lambda k: snap.get(k, "?")
+    return (f"STR{g('STR')} END{g('END')} DEX{g('DEX')} INT{g('INT')} SPR{g('SPR')} "
+            f"DEF{g('DEF')} Dmg{g('DmgMin')}-{g('DmgMax')}")
+
+
+def print_hist(hist, samples, pids, indent=""):
+    for dmg in sorted(hist):
+        bar = "#" * min(hist[dmg], 60)
+        print(f"{indent}{dmg:>5} | {hist[dmg]:<4} {bar}")
+    print(f"{indent}------+------")
+    print(f"{indent}n={len(samples)}  min={min(samples)}  max={max(samples)}  "
+          f"mean={statistics.mean(samples):.2f}  median={statistics.median(samples)}  "
+          f"stdev={statistics.pstdev(samples):.2f}  pids {min(pids)}..{max(pids)}")
 
 
 def build_index(pcap, port_filter=None):
@@ -335,13 +405,13 @@ def cmd_damage(frames, op_name, name_to_struct, args, timeline, events, self_han
             for pid, sid, kind, detail in sorted(win_ev):
                 print(f"#     pid {pid}: {kind}  {detail}")
 
-    hist = collections.Counter()
-    samples = []
-    pid_seen = []
+    roster = build_roster(frames, op_name, name_to_struct)
+    abs_tl = build_abstate_timelines(frames, op_name) if args.split_stats else {}
+
+    # collect matched swings
+    matched = []   # (pid, sid, atk, dfn, dmg)
     for f in frames:
-        if f["op"] != swing_op:
-            continue
-        if not (lo <= f["pid"] <= hi):
+        if f["op"] != swing_op or not (lo <= f["pid"] <= hi):
             continue
         if args.stream is not None and f["sid"] != args.stream:
             continue
@@ -353,9 +423,7 @@ def cmd_damage(frames, op_name, name_to_struct, args, timeline, events, self_han
             continue
         if args.defender is not None and dfn != args.defender:
             continue
-        hist[dmg] += 1
-        samples.append(dmg)
-        pid_seen.append(f["pid"])
+        matched.append((f["pid"], f["sid"], atk, dfn, dmg))
 
     filt = []
     if args.mob_id is not None:
@@ -367,22 +435,56 @@ def cmd_damage(frames, op_name, name_to_struct, args, timeline, events, self_han
     if args.stream is not None:
         filt.append(f"stream={args.stream}")
     filt.append(f"pid {lo}..{'end' if hi == float('inf') else int(hi)}")
-    print(f"# SWING_DAMAGE filter: {', '.join(filt)}")
+    split = "mob" + (" x stat-set (--split-stats)" if args.split_stats else "")
+    print(f"# SWING_DAMAGE filter: {', '.join(filt)}   | curves split by: {split}")
 
-    if not samples:
+    if not matched:
         print("(no matching SWING_DAMAGE frames)")
         return 0
 
-    print(f"\n{'DMG':>5} | Count")
-    print("------+------")
-    for dmg in sorted(hist):
-        bar = "#" * min(hist[dmg], 60)
-        print(f"{dmg:>5} | {hist[dmg]:<4} {bar}")
-    print("------+------")
-    print(f"n={len(samples)}  min={min(samples)}  max={max(samples)}  "
-          f"mean={statistics.mean(samples):.2f}  median={statistics.median(samples)}  "
-          f"stdev={statistics.pstdev(samples):.2f}")
-    print(f"pid span of matches: {min(pid_seen)}..{max(pid_seen)}")
+    # ---- bucket each swing into a curve ------------------------------------------------
+    # ALWAYS split by mob (the non-player entity). With --split-stats also split by the config
+    # "set": the player's stat SIGNATURE (captures Vitality etc. by value) + the mob's active
+    # abstate set (captures Fatal Slash etc. by id). One fight -> up to 4 curves for one mob:
+    # {base, +vitality, +fatalslash, +both}.
+    curves = collections.defaultdict(lambda: (collections.Counter(), [], []))  # key -> (hist,samples,pids)
+    labels = {}
+    order = {}
+    for pid, sid, atk, dfn, dmg in matched:
+        selfh = self_handle.get(sid)
+        if dfn == selfh:
+            mob_h, ply_h, arrow = atk, dfn, "IN "   # damage the player TAKES
+        elif atk == selfh:
+            mob_h, ply_h, arrow = dfn, atk, "OUT"   # damage the player DEALS
+        else:
+            mob_h, ply_h, arrow = atk, None, "?  "
+        mid = roster.get(mob_h, {}).get("mobid")
+        mlabel = f"mob{mid}" if mid is not None else f"h{mob_h}"
+        key = [mlabel, arrow.strip()]
+        label = f"{mlabel}  [{arrow}h{mob_h}]"
+        if args.split_stats:
+            at = stat_at(timeline, sid, pid) if ply_h is not None else None
+            psig = stat_sig(at[1] if at else None)
+            mabs = tuple(sorted(abstate_at(abs_tl, mob_h, pid)))
+            key += [psig, mabs]
+            label += f"  |  {psig}"
+            if mabs:
+                label += f"  |  enemyAbstate{list(mabs)}"
+        k = tuple(key)
+        h, s, p = curves[k]
+        h[dmg] += 1
+        s.append(dmg)
+        p.append(pid)
+        labels[k] = label
+        order.setdefault(k, (mlabel, len(order)))
+
+    print(f"\n=== {len(curves)} curve(s) ===")
+    for k in sorted(curves, key=lambda kk: order[kk]):
+        h, s, p = curves[k]
+        print(f"\n--- {labels[k]}  (n={len(s)}) ---")
+        print(f"{'DMG':>5} | Count")
+        print("------+------")
+        print_hist(h, s, p)
     return 0
 
 
@@ -411,6 +513,9 @@ def main() -> int:
     pd.add_argument("--stream", type=int, help="only this stream (avoid double-count in 2-client captures)")
     pd.add_argument("--start-packet", type=int)
     pd.add_argument("--end-packet", type=int)
+    pd.add_argument("--split-stats", action="store_true",
+                    help="one curve per config SET: player stat signature (Vitality etc. by value) x "
+                         "mob abstate set (Fatal Slash etc. by id). Curves are ALWAYS split by mob.")
 
     args = p.parse_args()
 
