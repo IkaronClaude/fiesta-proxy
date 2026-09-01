@@ -67,7 +67,9 @@ def print_usage_banner() -> None:
     print("  A garbage / '<unknown>' C-> stream means that conversation's 0x0807 handshake")
     print("  seed wasn't in the capture, so C->S can't be decrypted.")
     print("Flags: --port P(+)  --opcode 0xNNNN(+)  --no-hex  --no-struct  --hex-limit N")
-    print("       --max-frames N  --interleave  --chat  --hide-movement")
+    print("       --max-frames N (0=unlimited, default)  --no-interleave  --chat  --hide-movement")
+    print("Interleave (timestamp-ordered, both directions) is ON by default — the only view that shows")
+    print("  request->response pairing. Use --no-interleave for the old grouped-by-direction dump.")
     print("--hide-movement: drop per-step WALK/RUN spam (my + someone-else's moves);")
     print("  teleports / map-links / warps are KEPT (not movement spam).")
     print("=" * 78)
@@ -321,11 +323,16 @@ def extract_chat(body) -> str:
     return "".join(best).strip()
 
 
-def dump_one(label, off, body, op_name, name_to_struct, indent, show_hex, hex_limit, show_struct):
+def dump_one(label, off, body, op_name, name_to_struct, indent, show_hex, hex_limit, show_struct,
+             ts=None):
     op = opcode_of(body)
     pl = payload_of(body)
     name = op_name.get(op, "<unknown>")
-    print(f"{indent}{label} @{off:5d}  [0x{op:04X}] {name}  payload={len(pl)}b")
+    # The byte offset orders frames WITHIN one direction and nothing more -- it is not a clock, and
+    # anything with a duration (an abstate's restKeeptime, a cast time, a swing cadence) cannot be checked
+    # against frame order. The capture has had a real timestamp per frame all along; --timestamps prints it.
+    stamp = f" t={ts:.6f}" if ts is not None else ""
+    print(f"{indent}{label} @{off:5d}{stamp}  [0x{op:04X}] {name}  payload={len(pl)}b")
     if show_struct:
         sd = name_to_struct.get(name)
         if sd:
@@ -348,13 +355,21 @@ def main() -> int:
     p.add_argument("--no-hex", action="store_true")
     p.add_argument("--no-struct", action="store_true")
     p.add_argument("--hex-limit", type=int, default=128)
-    p.add_argument("--max-frames", type=int, default=200)
+    p.add_argument("--max-frames", type=int, default=0,
+                   help="cap frames per direction per conversation (0 = unlimited, the default)")
     p.add_argument("--opcode", action="append", type=lambda s: int(s, 0),
                    help="filter to one or more opcodes (repeatable)")
-    p.add_argument("--interleave", action="store_true",
-                   help="print C->S and S->C frames in one timestamp-ordered stream")
+    # Interleaved (timestamp-ordered, both directions) is the DEFAULT — it's the only view that shows
+    # request->response pairing, which is how you actually read a capture (see CLAUDE.md GOLDEN RULE).
+    # Pass --no-interleave to fall back to the old grouped-by-direction dump.
+    p.add_argument("--no-interleave", dest="interleave", action="store_false", default=True,
+                   help="disable the default interleave; group frames by direction instead")
     p.add_argument("--chat", action="store_true",
                    help="print only chat messages (annotations), decoded as their own line, interleaved")
+    p.add_argument("--timestamps", action="store_true",
+                   help="print each frame's capture timestamp, in seconds from the first frame of the "
+                        "conversation. Needed for anything with a DURATION -- abstate restKeeptime, cast "
+                        "times, swing cadence -- because the @offset is not a clock.")
     p.add_argument("--hide-movement", action="store_true",
                    help="suppress per-step movement spam (walk/run, own + others); keeps teleports/map-links/warps")
     args = p.parse_args()
@@ -403,7 +418,7 @@ def main() -> int:
                 if args.opcode and op not in args.opcode:
                     continue
                 out.append((offset_ts(seg, off), off, plen, b))
-                if len(out) >= args.max_frames:
+                if args.max_frames and len(out) >= args.max_frames:
                     break
             return out
 
@@ -431,10 +446,16 @@ def main() -> int:
             merged = [(ts, "S<-", off, b) for ts, off, _pl, b in s2c_frames] + \
                      [(ts, "C->", off, b) for ts, off, _pl, b in c2s_frames]
             merged.sort(key=lambda x: (x[0], x[2]))
+            # Relative to this CONVERSATION's first frame, not the capture's. A relog opens a new
+            # conversation and the two decode independently, so a capture-wide origin would put two
+            # unrelated sessions on one axis.
+            t0 = merged[0][0] if merged else 0.0
             print(f"  --- interleaved ({len(merged)}) ---")
             for ts, d, off, b in merged:
                 dump_one(d, off, b, op_name, name_to_struct, indent="    ",
-                         show_hex=not args.no_hex, hex_limit=args.hex_limit, show_struct=not args.no_struct)
+                         show_hex=not args.no_hex, hex_limit=args.hex_limit,
+                         show_struct=not args.no_struct,
+                         ts=(ts - t0) if args.timestamps else None)
             continue
 
         # default: S->C block then C->S block (as before)
