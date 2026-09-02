@@ -34,7 +34,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--opcode", help="filter to a single opcode (e.g. 0x0C0A)")
     p.add_argument("--port", type=int, help="filter to a single TCP port")
     p.add_argument("--max-frames", type=int, default=200)
-    p.add_argument("--hex-limit", type=int, default=128, help="hex bytes per frame")
+    p.add_argument("--hex-limit", type=int, default=HEX_LIMIT_DEFAULT,
+                   help=f"hex bytes per frame (0 = unlimited; default {HEX_LIMIT_DEFAULT}). "
+                        f"Anything withheld is reported loudly, never dropped silently.")
     return p.parse_args()
 
 
@@ -132,11 +134,19 @@ def ip_to_str(b: bytes) -> str:
     return ".".join(str(x) for x in b)
 
 
+# Same default, and the same reasoning, as `pcap_decode.HEX_LIMIT_DEFAULT`: a limit low enough to cut a
+# real payload in half turns "I read the frame" into "I read the first part of the frame and did not
+# notice". 0 means unlimited.
+HEX_LIMIT_DEFAULT = 65536
+
+
 def hex_dump(payload: bytes, limit: int) -> str:
-    head = payload[:limit]
+    head = payload if limit <= 0 else payload[:limit]
     out = " ".join(f"{b:02x}" for b in head)
-    if len(payload) > limit:
-        out += f" ... (+{len(payload) - limit} bytes)"
+    if len(head) < len(payload):
+        # Shouts, rather than trailing quietly after the bytes it withheld.
+        out += (f"  !! ({len(payload) - len(head)} BYTES NOT DISPLAYED!) payload is {len(payload)}b, "
+                f"--hex-limit is {limit} -- RAISE IT (0 = unlimited)")
     return out
 
 

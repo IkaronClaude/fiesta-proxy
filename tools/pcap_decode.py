@@ -82,6 +82,8 @@ def print_usage_banner() -> None:
     print("  A garbage / '<unknown>' C-> stream means that conversation's 0x0807 handshake")
     print("  seed wasn't in the capture, so C->S can't be decrypted.")
     print("Flags: --port P(+)  --opcode 0xNNNN(+)  --no-hex  --no-struct  --hex-limit N")
+    print(f"       --hex-limit N (0=unlimited, default {HEX_LIMIT_DEFAULT}) — withheld bytes are")
+    print("         reported as '!! (N BYTES NOT DISPLAYED!)', never dropped silently")
     print("       --max-frames N (0=unlimited, default)  --no-interleave  --chat  --hide-movement")
     print("Interleave (timestamp-ordered, both directions) is ON by default — the only view that shows")
     print("  request->response pairing. Use --no-interleave for the old grouped-by-direction dump.")
@@ -292,6 +294,34 @@ def hex_ascii_rows(data: bytes, width: int = 16, indent: str = "      ") -> list
     return rows
 
 
+# ⚠️ THE OLD DEFAULT WAS 128 BYTES, AND IT COST REAL TIME. The hex rows ARE the wire for every tool
+# downstream of this one, so a payload longer than the limit was silently cut off MID-STRUCT while the
+# dump still looked complete. `NC_CHAR_CLIENT_SKILL_CMD` is 790 bytes for a level-60 fighter; at 128 only
+# 9 of its 65 skill records survived, and a per-character empower allocation read as "not present".
+# Anything array-shaped -- skill lists, bulk mob rosters, inventories -- had the same failure mode.
+#
+# The default now covers every payload this protocol actually sends (the largest observed is a 4173-byte
+# `NC_BRIEFINFO_MOB_CMD`), and truncation, when it does happen, SHOUTS. 0 means unlimited.
+HEX_LIMIT_DEFAULT = 65536
+
+
+def emit_hex(pl: bytes, indent: str, hex_limit: int) -> None:
+    """Print a payload's hex rows, and say so LOUDLY if any of it was withheld.
+
+    One function rather than two copies: the truncation notice and the slicing have to agree, and they
+    previously lived in `dump_frames` and `dump_one` separately."""
+    shown = pl if hex_limit <= 0 else pl[:hex_limit]
+    for line in hex_ascii_rows(shown, indent=indent):
+        print(line)
+    if len(shown) < len(pl):
+        missing = len(pl) - len(shown)
+        # Deliberately not a hex row: the parsers downstream match `^\s+[0-9a-f]{4}\s+...`, so this must
+        # not look like one. It is also deliberately ugly -- the whole point is that it cannot be skimmed
+        # past the way `... +N bytes` was.
+        print(f"{indent}!! ({missing} BYTES NOT DISPLAYED!) payload is {len(pl)}b, "
+              f"--hex-limit is {hex_limit} -- RAISE IT (--hex-limit 0 = unlimited) before reading this frame")
+
+
 def ip_to_str(b: bytes) -> str:
     if len(b) == 4:
         return ".".join(str(x) for x in b)
@@ -314,10 +344,7 @@ def dump_frames(label: str, frames, op_name, name_to_struct,
                 for line in decode_struct(pl, struct_def, indent + "  "):
                     print(line)
         if show_hex and pl:
-            for line in hex_ascii_rows(pl[:hex_limit], indent=indent + "    "):
-                print(line)
-            if len(pl) > hex_limit:
-                print(f"{indent}    ... +{len(pl) - hex_limit} bytes")
+            emit_hex(pl, indent + "    ", hex_limit)
 
 
 def extract_chat(body) -> str:
@@ -354,10 +381,7 @@ def dump_one(label, off, body, op_name, name_to_struct, indent, show_hex, hex_li
             for line in decode_struct(pl, sd, indent + "  "):
                 print(line)
     if show_hex and pl:
-        for line in hex_ascii_rows(pl[:hex_limit], indent=indent + "    "):
-            print(line)
-        if len(pl) > hex_limit:
-            print(f"{indent}    ... +{len(pl) - hex_limit} bytes")
+        emit_hex(pl, indent + "    ", hex_limit)
 
 
 # ---- main
@@ -369,7 +393,9 @@ def main() -> int:
                    help="filter to conversations with this server port (repeatable)")
     p.add_argument("--no-hex", action="store_true")
     p.add_argument("--no-struct", action="store_true")
-    p.add_argument("--hex-limit", type=int, default=128)
+    p.add_argument("--hex-limit", type=int, default=HEX_LIMIT_DEFAULT,
+                   help=f"max payload bytes to hex-dump per frame (0 = unlimited; "
+                        f"default {HEX_LIMIT_DEFAULT}). Anything withheld is reported loudly.")
     p.add_argument("--max-frames", type=int, default=0,
                    help="cap frames per direction per conversation (0 = unlimited, the default)")
     p.add_argument("--opcode", action="append", type=lambda s: int(s, 0),
