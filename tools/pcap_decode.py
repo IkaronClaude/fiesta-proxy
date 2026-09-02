@@ -27,6 +27,21 @@ import sys
 
 import dpkt
 
+# ⚠️ A REDIRECTED stdout on Windows defaults to the ANSI codepage (cp1252), and the hex dump prints raw
+# packet bytes as latin-1 text -- so the first frame containing a byte cp1252 cannot map (0x81, 0x8D,
+# 0x8F, 0x90, 0x9D, or 0x95) kills the process with UnicodeEncodeError, mid-dump.
+#
+# That is not cosmetic. The output looks like a complete decode that simply ends, so a grep over it
+# reports a CONFIDENT ABSENCE: CombatPriest.pcapng was read here as having ZERO damage packets when it has
+# 74 swings and 22 skill hits, because the dump died 40% of the way in. It only appears when the output is
+# PIPED (an interactive console negotiates its own encoding) and only with the hex dump on -- i.e. exactly
+# when a capture is being analysed rather than eyeballed.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except (AttributeError, ValueError):
+        pass
+
 from _fiesta_proto import (
     XorCipher,
     is_handshake_body,
